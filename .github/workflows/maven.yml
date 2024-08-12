@@ -17,4 +17,5 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
         cache: 'maven'
+    - run: mvn --version
     - run: mvn -B -U install
