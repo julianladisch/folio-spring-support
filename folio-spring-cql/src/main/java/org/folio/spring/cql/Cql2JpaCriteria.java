@@ -26,6 +26,7 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 import lombok.extern.log4j.Log4j2;
 import org.apache.commons.lang3.StringUtils;
@@ -274,7 +275,8 @@ public class Cql2JpaCriteria<E> {
   }
 
   private static <G extends Comparable<? super G>> Predicate toPredicate(Expression<G> field, G value,
-    String comparator, CriteriaBuilder cb) throws QueryValidationException {
+      String comparator, CriteriaBuilder cb) throws QueryValidationException {
+
     return switch (comparator) {
       case ">" -> cb.greaterThan(field, value);
       case "<" -> cb.lessThan(field, value);
@@ -282,17 +284,34 @@ public class Cql2JpaCriteria<E> {
       case "<=" -> cb.lessThanOrEqualTo(field, value);
       case "==", "=" -> cb.equal(field, value);
       case NOT_EQUALS_OPERATOR -> cb.notEqual(field, value);
-      default -> throw new QueryValidationException(
-        "CQL: Unsupported operator '"
-          + comparator
-          + "', "
-          + " only supports '=', '==', and '<>' (possibly with right truncation)");
+      default -> throw unsupportedOperatorException(comparator);
     };
   }
 
+  private static <G extends Comparable<? super G>> Predicate toPredicate(Expression<G> field, Expression<G> value,
+      String comparator, CriteriaBuilder cb) throws QueryValidationException {
+
+    return switch (comparator) {
+      case ">" -> cb.greaterThan(field, value);
+      case "<" -> cb.lessThan(field, value);
+      case ">=" -> cb.greaterThanOrEqualTo(field, value);
+      case "<=" -> cb.lessThanOrEqualTo(field, value);
+      case "==", "=" -> cb.equal(field, value);
+      case NOT_EQUALS_OPERATOR -> cb.notEqual(field, value);
+      default -> throw unsupportedOperatorException(comparator);
+    };
+  }
+
+  private static QueryValidationException unsupportedOperatorException(String operator) {
+    return new QueryValidationException(
+        "CQL: Unsupported operator '"
+            + operator
+            + "', "
+            + " only supports '=', '==', and '<>' (possibly with right truncation)");
+  }
+
   private Predicate indexNode(Path<?> field, CQLTermNode node, CqlModifiers modifiers,
-                              CriteriaBuilder cb)
-    throws QueryValidationException {
+                              CriteriaBuilder cb) throws QueryValidationException {
 
     if (!isEmpty(modifiers.getRelationModifiers())) {
       return buildModifiersQuery(field, modifiers, cb);
@@ -364,12 +383,16 @@ public class Cql2JpaCriteria<E> {
   /**
    * Create an SQL expression using LIKE query syntax.
    */
-  private static Predicate queryByLike(Path<String> field, String term, String comparator,
+  private Predicate queryByLike(Path<String> field0, String term0, String comparator,
                                 CriteriaBuilder cb) {
+
+    var wrapper = wrapper(field0, cb);
+    var field = wrapper.apply(field0);
+    var term = wrapper.apply(cb.literal(cql2like(term0)));
     if (NOT_EQUALS_OPERATOR.equals(comparator)) {
-      return cb.notLike(field, cql2like(term), '\\');
+      return cb.notLike(field, term, '\\');
     } else {
-      return cb.like(field, cql2like(term), '\\');
+      return cb.like(field, term, '\\');
     }
   }
 
@@ -381,15 +404,45 @@ public class Cql2JpaCriteria<E> {
   }
 
   /**
+   * Wrap the field with functions lower and/or f_unaccent as needed.
+   */
+  private UnaryOperator<Expression<String>> wrapper(Expression<String> field, CriteriaBuilder cb) {
+    if (!field.getJavaType().equals(String.class)) {
+      return UnaryOperator.identity();
+    }
+    var respectAccents = domainClass.getAnnotation(RespectAccents.class) != null;
+    var respectCase = domainClass.getAnnotation(RespectCase.class) != null;
+    if (respectAccents) {
+      if (respectCase) {
+        return UnaryOperator.identity();
+      } else {
+        return cb::lower;
+      }
+    } else {
+      if (respectCase) {
+        return expression -> cb.function("f_unaccent", String.class, expression);
+      } else {
+        return expression -> cb.lower(cb.function("f_unaccent", String.class, expression));
+      }
+    }
+  }
+
+  /**
    * Create an SQL expression using SQL as is syntax.
    */
   @SuppressWarnings({"rawtypes", "unchecked"})
-  private static Predicate queryBySql(Expression field, Comparable term, String comparator,
-                                      CriteriaBuilder cb) throws QueryValidationException {
-    var value = (String) term;
+  private Predicate queryBySql(Expression field, Comparable term, String comparator,
+      CriteriaBuilder cb) throws QueryValidationException {
 
+    var value = (String) term;
     var javaType = field.getJavaType();
-    if (Number.class.equals(javaType)) {
+
+    if (String.class.equals(javaType)) {
+      UnaryOperator<Expression<String>> wrapper = wrapper(field, cb);
+      field = wrapper.apply(field);
+      var termExpression = wrapper.apply(cb.literal(cql2like(term.toString())));
+      return toPredicate(field, termExpression, comparator, cb);
+    } else if (Number.class.equals(javaType)) {
       term = Integer.parseInt(value);
     } else if (UUID.class.equals(javaType)) {
       term = UUID.fromString(value);
